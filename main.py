@@ -1,10 +1,11 @@
 """gta6-twitch-ccu-forecast-01 entry: forecast GTA VI's launch-day Twitch
 viewers, hour by hour, from the case's own comparable launches.
 
-Model (v3; leave-one-out cross-validation over the comparable launches in
-the practice cases, mean log pinball loss: 0.364 over all launches, 0.250
-on rolling-midnight launches, 0.181 on large rolling-midnight launches —
-v2 scored 0.377 / 0.295 / 0.202, v1 0.392 / 0.315 / 0.231):
+Model (v4; leave-one-out cross-validation over the comparable launches in
+the practice cases, mean log pinball loss: 0.368 over all launches, 0.242
+on rolling-midnight launches, 0.171 on large rolling-midnight launches —
+v3 scored 0.370 / 0.251 / 0.184, v2 0.377 / 0.295 / 0.202, v1 0.392 /
+0.315 / 0.231):
 
   For every past launch in the case's `comparables`, take its release-day
   curve hour by hour and form the log-ratio to its own hour-1 viewers. Each
@@ -21,14 +22,19 @@ v2 scored 0.377 / 0.295 / 0.202, v1 0.392 / 0.315 / 0.231):
   day (offsets -168..-25), which captures the audience's timezone mix.
   Two launches whose pre-release audiences keep the same daily rhythm
   tend to trace the same release-day shape, so comparables are weighted
-  by the cosine similarity of their fingerprint to the target's.
+  by the cosine similarity of their fingerprint to the target's. The
+  same fingerprint is computed for live channels (the streamer supply's
+  daily rhythm) and applied as a second, wider kernel.
 
   Per hour, a weighted ridge regression of the log-ratios on the size gap
   (log10 of the comparable's hour-1 viewers minus the target's) removes
   the size trend, so the intercept is the size-adjusted centre for a
   target of exactly this size; the spread is the regression's weighted
   residual standard deviation (scaled by 0.85, or 1.0 in the fingerprint
-  regime, as cross-validation prefers). The five quantiles are
+  regime, as cross-validation prefers). In the fingerprint regime the
+  centre is then blended 60/40 with a second fit over only the closest
+  fingerprint matches (cosine above 0.8), which sharpens the shape for
+  large launches. The five quantiles are
 
       q_tau(h) = p1 * exp(mu_h + z_tau * sd_h)
 
@@ -62,7 +68,10 @@ W_MISMATCH = 0.1  # weight when the unlock class clearly differs
 W_UNKNOWN = 0.6   # weight when either unlock class is unreadable
 BETA_NAME = 1.0   # weight boost per unit of franchise-name Jaccard overlap
 BETA_PLAT = 0.5   # weight boost per unit of platform Jaccard overlap
-W_FINGER = 0.25   # kernel width for 1 - cosine(diurnal fingerprints)
+W_FINGER = 0.3    # kernel width for 1 - cosine(viewer diurnal fingerprints)
+W_FINGER_CH = 0.5  # kernel width for 1 - cosine(channel diurnal fingerprints)
+SUBSET_COS = 0.8  # fingerprint cosine above which a comparable is "close"
+SUBSET_BLEND = 0.4  # weight of the close-subset fit in the blended centre
 RIDGE = 0.05      # ridge penalty on the size-trend slope
 SD_SCALE = 0.85
 SD_SCALE_FINGER = 1.0  # spread scale in the fingerprint regime
@@ -127,8 +136,8 @@ def target_platforms(notes):
     return platform_set(m.group(1)) if m else set()
 
 
-def diurnal_fingerprint(day_start, hourly):
-    """Mean log viewers by UTC hour of day over offsets -168..-25, centred."""
+def diurnal_fingerprint(day_start, hourly, field="viewers"):
+    """Mean log of `field` by UTC hour of day over offsets -168..-25, centred."""
     start = parse(day_start)
     by_hour = {}
     for pt in hourly:
@@ -136,8 +145,8 @@ def diurnal_fingerprint(day_start, hourly):
         if off != int(off):
             continue
         off = int(off)
-        if -168 <= off <= -25:
-            by_hour.setdefault(off % 24, []).append(math.log(max(1, pt["viewers"])))
+        if -168 <= off <= -25 and pt.get(field):
+            by_hour.setdefault(off % 24, []).append(math.log(max(1, pt[field])))
     if len(by_hour) < 18:
         return None
     vec = []
@@ -185,7 +194,9 @@ def launches_from(case):
                     "curve": curve, "p1": curve[1], "pre_ratio": pre_ratio,
                     "tokens": name_tokens(comp.get("name")),
                     "plats": platform_set(comp.get("platforms")),
-                    "finger": diurnal_fingerprint(comp["day_start"], comp["hourly"])})
+                    "finger": diurnal_fingerprint(comp["day_start"], comp["hourly"]),
+                    "finger_ch": diurnal_fingerprint(comp["day_start"], comp["hourly"],
+                                                     field="channels")})
     return out
 
 
@@ -206,7 +217,10 @@ def target_features(case):
             "tokens": name_tokens((case.get("game") or {}).get("name")),
             "plats": target_platforms(notes),
             "finger": diurnal_fingerprint(case["day_start"],
-                                          case.get("history_hourly") or [])}
+                                          case.get("history_hourly") or []),
+            "finger_ch": diurnal_fingerprint(case["day_start"],
+                                             case.get("history_hourly") or [],
+                                             field="channels")}
 
 
 def weight(target, t, use_finger):
@@ -229,6 +243,9 @@ def weight(target, t, use_finger):
         cs = cosine(target["finger"], t["finger"])
         if cs is not None:
             w *= math.exp(-(1.0 - cs) / W_FINGER)
+        cs_ch = cosine(target["finger_ch"], t["finger_ch"])
+        if cs_ch is not None:
+            w *= math.exp(-(1.0 - cs_ch) / W_FINGER_CH)
     return w
 
 
@@ -281,6 +298,15 @@ def forecast_case(case):
             mu, sd = loclin(rows)
         else:
             mu, sd = 0.0, 0.5
+        if use_finger and rows:
+            close = [(math.log10(t["p1"]) - tx, math.log(t["curve"][h] / t["p1"]), w)
+                     for t, w in weighted
+                     if h in t["curve"] and w > 0
+                     and (cosine(target["finger"], t["finger"]) or 0.0) > SUBSET_COS]
+            if len(close) >= 4:
+                mu2, sd2 = loclin(close)
+                mu = (1 - SUBSET_BLEND) * mu + SUBSET_BLEND * mu2
+                sd = (1 - SUBSET_BLEND) * sd + SUBSET_BLEND * sd2
         sd = min(max(sd * sd_scale, SD_FLOOR), SD_CAP)
         q = [round2(min(p1 * math.exp(mu + z * sd), 1e9)) for z in Z]
         hours.append({"hour": h, "q": q})
