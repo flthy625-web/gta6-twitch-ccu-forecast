@@ -1,23 +1,31 @@
 """gta6-twitch-ccu-forecast-01 entry: forecast GTA VI's launch-day Twitch
 viewers, hour by hour, from the case's own comparable launches.
 
-Model (chosen by leave-one-out cross-validation over the comparable launches,
-where it scores a mean log pinball loss of about 0.39 against 0.93 for the
-persistence baseline):
+Model (v2, chosen by leave-one-out cross-validation over the comparable
+launches in the practice cases, where it improves on the plain weighted
+lognormal of v1 on every slice: mean log pinball loss 0.377 vs 0.392 over
+all launches, 0.295 vs 0.315 on rolling-midnight launches, 0.202 vs 0.231
+on large rolling-midnight launches):
 
   For every past launch in the case's `comparables`, take its release-day
-  curve hour by hour and form the log-ratio to its own hour-1 viewers. For the
-  target, each comparable is weighted by similarity: same unlock pattern
-  (rolling midnight local / single global unlock / early-access contaminated,
-  read from the unlock notes), closeness of its hour-1 audience size, and
-  closeness of its pre-release tail (mean viewers in the 6 hours before the
-  release day, relative to hour 1). The five quantiles for hour h are then
+  curve hour by hour and form the log-ratio to its own hour-1 viewers. Each
+  comparable is weighted by similarity to the target: same unlock pattern
+  (rolling midnight local / single global unlock / early-access
+  contaminated, read from the unlock notes), closeness of hour-1 audience
+  size, closeness of the pre-release tail (mean viewers in the 6 hours
+  before the release day, relative to hour 1), franchise-name overlap with
+  the target game, and platform overlap.
+
+  Per hour, a weighted ridge regression of the log-ratios on the size gap
+  (log10 of the comparable's hour-1 viewers minus the target's) removes the
+  size trend, so the intercept is the size-adjusted centre for a target of
+  exactly this size; the spread is the regression's weighted residual
+  standard deviation, scaled by 0.85. The five quantiles are
 
       q_tau(h) = p1 * exp(mu_h + z_tau * sd_h)
 
-  with mu_h, sd_h the weighted mean and standard deviation of the log-ratios
-  at hour h. If a case carries no usable comparable, the entry falls back to
-  the persistence forecast (every hour at hour 1's level, spread widening like
+  If a case carries no usable comparable, the entry falls back to the
+  persistence forecast (every hour at hour 1's level, spread widening like
   a random walk's).
 
 Runs on the Python 3.13 standard library only, no network, deterministic.
@@ -26,6 +34,7 @@ Runs on the Python 3.13 standard library only, no network, deterministic.
 import json
 import math
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,10 +50,16 @@ Z = [-1.644854, -0.674490, 0.0, 0.674490, 1.644854]
 # Cross-validated parameters (leave-one-out over 37 comparable launches).
 W_P1 = 0.6        # kernel width for log10 of hour-1 viewers
 W_PRE = 1.6       # kernel width for log of the pre-release tail ratio
-W_MISMATCH = 0.2  # weight when the unlock class clearly differs
-W_UNKNOWN = 0.7   # weight when either unlock class is unreadable
+W_MISMATCH = 0.1  # weight when the unlock class clearly differs
+W_UNKNOWN = 0.6   # weight when either unlock class is unreadable
+BETA_NAME = 1.0   # weight boost per unit of franchise-name Jaccard overlap
+BETA_PLAT = 0.5   # weight boost per unit of platform Jaccard overlap
+RIDGE = 0.05      # ridge penalty on the size-trend slope
+SD_SCALE = 0.85
 SD_FLOOR = 0.22
 SD_CAP = 1.6
+
+STOP = {"the", "of", "and", "a"}
 
 
 def parse(ts):
@@ -61,6 +76,41 @@ def unlock_class(text):
     if "midnight" in t:
         return "rolling"
     return "unknown"
+
+
+def name_tokens(name):
+    raw = "".join(c if c.isalnum() else " " for c in (name or "").lower()).split()
+    return {t for t in raw if t not in STOP and len(t) >= 2}
+
+
+def name_sim(a, b):
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def platform_set(text):
+    """Coarse platform families from strings like 'PC, PS4/PS5, Xbox One/Series'."""
+    t = (text or "").lower()
+    out = set()
+    if "ps5" in t or "playstation 5" in t:
+        out.add("ps5")
+    if "ps4" in t or "playstation 4" in t:
+        out.add("ps4")
+    if "xbox" in t:
+        out.add("xbox")
+    if "pc" in t or "windows" in t:
+        out.add("pc")
+    if "switch" in t or "nintendo" in t:
+        out.add("switch")
+    return out
+
+
+def target_platforms(notes):
+    """The case notes name the target's platforms in prose ('on PS5 only',
+    'on PS4, Xbox One (console only; ...)'). Best effort; empty if unreadable."""
+    m = re.search(r"\bon\s+([^.;()]+)", notes or "")
+    return platform_set(m.group(1)) if m else set()
 
 
 def day_curve(day_start, hourly):
@@ -87,7 +137,9 @@ def launches_from(case):
         if 1 not in curve or len(curve) < 20:
             continue  # not a launch day (e.g. a category's pre-release history)
         out.append({"cls": unlock_class(comp.get("unlock")),
-                    "curve": curve, "p1": curve[1], "pre_ratio": pre_ratio})
+                    "curve": curve, "p1": curve[1], "pre_ratio": pre_ratio,
+                    "tokens": name_tokens(comp.get("name")),
+                    "plats": platform_set(comp.get("platforms"))})
     return out
 
 
@@ -103,23 +155,44 @@ def target_features(case):
         if off == int(off) and -6 <= off < 0:
             pre.append(max(1, pt["viewers"]))
     pre_ratio = (sum(pre) / len(pre)) / p1 if pre else None
-    return p1, pre_ratio, unlock_class(case.get("notes"))
+    notes = case.get("notes")
+    return {"p1": p1, "pre_ratio": pre_ratio, "cls": unlock_class(notes),
+            "tokens": name_tokens((case.get("game") or {}).get("name")),
+            "plats": target_platforms(notes)}
 
 
 def weight(target, t):
-    p1, pre_ratio, cls = target
-    if t["cls"] == cls:
+    if t["cls"] == target["cls"]:
         w = 1.0
-    elif "unknown" in (t["cls"], cls):
+    elif "unknown" in (t["cls"], target["cls"]):
         w = W_UNKNOWN
     else:
         w = W_MISMATCH
-    d = abs(math.log10(t["p1"]) - math.log10(p1))
+    d = abs(math.log10(t["p1"]) - math.log10(target["p1"]))
     w *= math.exp(-0.5 * (d / W_P1) ** 2)
-    if pre_ratio and t["pre_ratio"]:
-        dp = abs(math.log(max(t["pre_ratio"], 1e-3)) - math.log(max(pre_ratio, 1e-3)))
+    if target["pre_ratio"] and t["pre_ratio"]:
+        dp = abs(math.log(max(t["pre_ratio"], 1e-3)) - math.log(max(target["pre_ratio"], 1e-3)))
         w *= math.exp(-0.5 * (dp / W_PRE) ** 2)
+    w *= math.exp(BETA_NAME * name_sim(target["tokens"], t["tokens"]))
+    if target["plats"] and t["plats"]:
+        jac = len(target["plats"] & t["plats"]) / len(target["plats"] | t["plats"])
+        w *= math.exp(BETA_PLAT * jac)
     return w
+
+
+def loclin(rows):
+    """rows: [(x, y, w)] with x centred on the target -> (intercept, resid sd)."""
+    sw = sum(w for _, _, w in rows)
+    if sw <= 0:
+        return 0.0, 0.5
+    mx = sum(x * w for x, _, w in rows) / sw
+    my = sum(y * w for _, y, w in rows) / sw
+    sxx = sum(w * (x - mx) ** 2 for x, _, w in rows) + RIDGE
+    sxy = sum(w * (x - mx) * (y - my) for x, y, w in rows)
+    b = sxy / sxx if sxx > 0 else 0.0
+    a = my - b * mx
+    var = sum(w * (y - (a + b * x)) ** 2 for x, y, w in rows) / sw
+    return a, math.sqrt(max(var, 0.0))
 
 
 def round2(x):
@@ -135,7 +208,7 @@ def forecast_case(case):
     if case["levels"] != LEVELS:
         raise ValueError(f"case asks for levels {case['levels']}, not {LEVELS}")
     target = target_features(case)
-    p1 = target[0]
+    p1 = target["p1"]
     train = launches_from(case)
     hours = []
     if not train:
@@ -145,14 +218,16 @@ def forecast_case(case):
             hours.append({"hour": h, "q": q})
         return {"hours": hours}
     weighted = [(t, weight(target, t)) for t in train]
+    tx = math.log10(p1)
     for row in case["forecast"]:
         h = row["hour"]
-        pairs = [(math.log(t["curve"][h] / t["p1"]), w)
-                 for t, w in weighted if h in t["curve"]]
-        sw = sum(w for _, w in pairs)
-        mu = sum(v * w for v, w in pairs) / sw
-        var = sum(w * (v - mu) ** 2 for v, w in pairs) / sw
-        sd = min(max(math.sqrt(var), SD_FLOOR), SD_CAP)
+        rows = [(math.log10(t["p1"]) - tx, math.log(t["curve"][h] / t["p1"]), w)
+                for t, w in weighted if h in t["curve"] and w > 0]
+        if rows:
+            mu, sd = loclin(rows)
+        else:
+            mu, sd = 0.0, 0.5
+        sd = min(max(sd * SD_SCALE, SD_FLOOR), SD_CAP)
         q = [round2(min(p1 * math.exp(mu + z * sd), 1e9)) for z in Z]
         hours.append({"hour": h, "q": q})
     return {"hours": hours}
