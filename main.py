@@ -1,11 +1,10 @@
 """gta6-twitch-ccu-forecast-01 entry: forecast GTA VI's launch-day Twitch
 viewers, hour by hour, from the case's own comparable launches.
 
-Model (v2, chosen by leave-one-out cross-validation over the comparable
-launches in the practice cases, where it improves on the plain weighted
-lognormal of v1 on every slice: mean log pinball loss 0.377 vs 0.392 over
-all launches, 0.295 vs 0.315 on rolling-midnight launches, 0.202 vs 0.231
-on large rolling-midnight launches):
+Model (v3; leave-one-out cross-validation over the comparable launches in
+the practice cases, mean log pinball loss: 0.364 over all launches, 0.250
+on rolling-midnight launches, 0.181 on large rolling-midnight launches —
+v2 scored 0.377 / 0.295 / 0.202, v1 0.392 / 0.315 / 0.231):
 
   For every past launch in the case's `comparables`, take its release-day
   curve hour by hour and form the log-ratio to its own hour-1 viewers. Each
@@ -16,11 +15,20 @@ on large rolling-midnight launches):
   before the release day, relative to hour 1), franchise-name overlap with
   the target game, and platform overlap.
 
+  For rolling-midnight targets there is one more similarity signal, the
+  strongest of the set: the audience's diurnal fingerprint — the mean
+  log-viewer profile by UTC hour of day over the week before the release
+  day (offsets -168..-25), which captures the audience's timezone mix.
+  Two launches whose pre-release audiences keep the same daily rhythm
+  tend to trace the same release-day shape, so comparables are weighted
+  by the cosine similarity of their fingerprint to the target's.
+
   Per hour, a weighted ridge regression of the log-ratios on the size gap
-  (log10 of the comparable's hour-1 viewers minus the target's) removes the
-  size trend, so the intercept is the size-adjusted centre for a target of
-  exactly this size; the spread is the regression's weighted residual
-  standard deviation, scaled by 0.85. The five quantiles are
+  (log10 of the comparable's hour-1 viewers minus the target's) removes
+  the size trend, so the intercept is the size-adjusted centre for a
+  target of exactly this size; the spread is the regression's weighted
+  residual standard deviation (scaled by 0.85, or 1.0 in the fingerprint
+  regime, as cross-validation prefers). The five quantiles are
 
       q_tau(h) = p1 * exp(mu_h + z_tau * sd_h)
 
@@ -54,8 +62,10 @@ W_MISMATCH = 0.1  # weight when the unlock class clearly differs
 W_UNKNOWN = 0.6   # weight when either unlock class is unreadable
 BETA_NAME = 1.0   # weight boost per unit of franchise-name Jaccard overlap
 BETA_PLAT = 0.5   # weight boost per unit of platform Jaccard overlap
+W_FINGER = 0.25   # kernel width for 1 - cosine(diurnal fingerprints)
 RIDGE = 0.05      # ridge penalty on the size-trend slope
 SD_SCALE = 0.85
+SD_SCALE_FINGER = 1.0  # spread scale in the fingerprint regime
 SD_FLOOR = 0.22
 SD_CAP = 1.6
 
@@ -68,6 +78,10 @@ def parse(ts):
 
 def unlock_class(text):
     t = (text or "").lower()
+    # Negations first: "no early access" describes a clean launch, not an
+    # early-access one (the Wolverine case notes say exactly that).
+    t = t.replace("no early access", "").replace("no early-access", "")
+    t = t.replace("without early access", "").replace("without early-access", "")
     if "early access" in t or "early-access" in t:
         return "early"
     if ("single global" in t or "simultaneous global" in t
@@ -113,6 +127,37 @@ def target_platforms(notes):
     return platform_set(m.group(1)) if m else set()
 
 
+def diurnal_fingerprint(day_start, hourly):
+    """Mean log viewers by UTC hour of day over offsets -168..-25, centred."""
+    start = parse(day_start)
+    by_hour = {}
+    for pt in hourly:
+        off = (parse(pt["from"]) - start).total_seconds() / 3600.0
+        if off != int(off):
+            continue
+        off = int(off)
+        if -168 <= off <= -25:
+            by_hour.setdefault(off % 24, []).append(math.log(max(1, pt["viewers"])))
+    if len(by_hour) < 18:
+        return None
+    vec = []
+    for hod in range(24):
+        vals = by_hour.get(hod)
+        vec.append(sum(vals) / len(vals) if vals else 0.0)
+    mean = sum(vec) / 24
+    return [v - mean for v in vec]
+
+
+def cosine(a, b):
+    if a is None or b is None:
+        return None
+    da = math.sqrt(sum(x * x for x in a))
+    db = math.sqrt(sum(x * x for x in b))
+    if da <= 0 or db <= 0:
+        return None
+    return sum(x * y for x, y in zip(a, b)) / (da * db)
+
+
 def day_curve(day_start, hourly):
     """Hour index 1..24 of the release day -> viewers, plus the pre-tail ratio."""
     start = parse(day_start)
@@ -139,7 +184,8 @@ def launches_from(case):
         out.append({"cls": unlock_class(comp.get("unlock")),
                     "curve": curve, "p1": curve[1], "pre_ratio": pre_ratio,
                     "tokens": name_tokens(comp.get("name")),
-                    "plats": platform_set(comp.get("platforms"))})
+                    "plats": platform_set(comp.get("platforms")),
+                    "finger": diurnal_fingerprint(comp["day_start"], comp["hourly"])})
     return out
 
 
@@ -158,10 +204,12 @@ def target_features(case):
     notes = case.get("notes")
     return {"p1": p1, "pre_ratio": pre_ratio, "cls": unlock_class(notes),
             "tokens": name_tokens((case.get("game") or {}).get("name")),
-            "plats": target_platforms(notes)}
+            "plats": target_platforms(notes),
+            "finger": diurnal_fingerprint(case["day_start"],
+                                          case.get("history_hourly") or [])}
 
 
-def weight(target, t):
+def weight(target, t, use_finger):
     if t["cls"] == target["cls"]:
         w = 1.0
     elif "unknown" in (t["cls"], target["cls"]):
@@ -177,6 +225,10 @@ def weight(target, t):
     if target["plats"] and t["plats"]:
         jac = len(target["plats"] & t["plats"]) / len(target["plats"] | t["plats"])
         w *= math.exp(BETA_PLAT * jac)
+    if use_finger:
+        cs = cosine(target["finger"], t["finger"])
+        if cs is not None:
+            w *= math.exp(-(1.0 - cs) / W_FINGER)
     return w
 
 
@@ -217,7 +269,9 @@ def forecast_case(case):
             q = [round2(p1 * math.exp(z * 0.15 * math.sqrt(h - 1))) for z in Z]
             hours.append({"hour": h, "q": q})
         return {"hours": hours}
-    weighted = [(t, weight(target, t)) for t in train]
+    use_finger = target["cls"] == "rolling" and target["finger"] is not None
+    sd_scale = SD_SCALE_FINGER if use_finger else SD_SCALE
+    weighted = [(t, weight(target, t, use_finger)) for t in train]
     tx = math.log10(p1)
     for row in case["forecast"]:
         h = row["hour"]
@@ -227,7 +281,7 @@ def forecast_case(case):
             mu, sd = loclin(rows)
         else:
             mu, sd = 0.0, 0.5
-        sd = min(max(sd * SD_SCALE, SD_FLOOR), SD_CAP)
+        sd = min(max(sd * sd_scale, SD_FLOOR), SD_CAP)
         q = [round2(min(p1 * math.exp(mu + z * sd), 1e9)) for z in Z]
         hours.append({"hour": h, "q": q})
     return {"hours": hours}

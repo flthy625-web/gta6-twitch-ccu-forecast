@@ -50,6 +50,8 @@ def load_launches(path):
 
 def unlock_class(text):
     t = text.lower()
+    t = t.replace("no early access", "").replace("no early-access", "")
+    t = t.replace("without early access", "").replace("without early-access", "")
     if "early access" in t or "early-access" in t:
         return "early"
     if "single global" in t or "simultaneous global" in t or "single simultaneous" in t or "simultaneous across" in t:
